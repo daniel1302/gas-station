@@ -3,7 +3,7 @@ name: Gas Station Release Binaries
 on:
   push:
     tags:
-      - "gas-station/v*"
+      - "v*"
 
 permissions:
   contents: read
