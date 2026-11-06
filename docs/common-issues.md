@@ -1,6 +1,40 @@
 
 # Common Issues
 
+## Upgrading from JSON-RPC to gRPC
+
+**Problem:**
+
+> **Operator-visible breaking change:** the Gas Station now talks to the IOTA full node over **gRPC** instead of JSON-RPC.
+
+**What changes:** `fullnode-url` must now point at the full node's **gRPC** endpoint instead of its JSON-RPC endpoint. The field is still a plain URL string; only the host/port/scheme you put there changes. For the public IOTA networks, that means:
+
+| Network | Old JSON-RPC URL                | New gRPC URL                     |
+| ------- | ------------------------------- | -------------------------------- |
+| Mainnet | `https://api.mainnet.iota.cafe` | `https://grpc.mainnet.iota.cafe` |
+| Testnet | `https://api.testnet.iota.cafe` | `https://grpc.testnet.iota.cafe` |
+| Devnet  | `https://api.devnet.iota.cafe`  | `https://grpc.devnet.iota.cafe`  |
+
+If you run your own full node, use its gRPC address instead.
+
+If `fullnode-url` still points at one of the three public JSON-RPC endpoints above, the Gas Station **automatically connects to the matching gRPC endpoint instead** and logs a warning at startup, so an existing deployment keeps working unmodified. This redirect only covers the well-known public hosts — a self-hosted JSON-RPC URL cannot be guessed and will simply fail at the first RPC call.
+
+**Explanation:**
+
+JSON-RPC is being retired upstream in favor of gRPC as the full node transport, so the Gas Station has moved to the [iota-rust-sdk](https://github.com/iotaledger/iota-rust-sdk) gRPC client ahead of that deprecation.
+
+**Solution:**
+
+What you need to do when upgrading an existing deployment:
+
+1. Repoint `fullnode-url` at your full node's gRPC endpoint (see table above, or the equivalent for your own node).
+2. Make sure the full node you're pointing at actually has its gRPC API enabled: `enable-grpc-api: true` in the node's own config (`grpc-api-config` can be left at its defaults unless you need to tune message-size or timeout limits). A node that only serves JSON-RPC will refuse the connection, or requests against it will fail.
+3. `fullnode-basic-auth`, if you use it, is unaffected and passed through the same way.
+
+**Changing `fullnode-url` changes the Redis storage namespace.** The Gas Station namespaces all of its Redis state (coin registry, reservations, daily gas usage counter) by the configured full node host, so repointing the URL makes it start from a fresh, empty namespace: the coin pool is re-initialized from the sponsor's on-chain coins, in-flight reservations are dropped, and the daily gas usage counter resets. The old namespace's keys are left behind in Redis and can be cleaned up manually. Because of this, update the URL on **all instances at once during a full stop** — in a rolling deploy, old and new instances would track the same on-chain coins in two independent namespaces and could hand out the same coin twice (equivocation). The automatic redirect described above deliberately does *not* change the namespace, so you can defer the config edit to a convenient maintenance window.
+
+Note also that the new gRPC client connects lazily, so a bad or unreachable `fullnode-url` will now surface as a connection error at startup or on first use, rather than at config-load time.
+
 ## Could not find the referenced object
 
 **Problem:**
@@ -97,3 +131,88 @@ In case you use Docker Compose, please edit the docker-compose file:
     environment:
     - RUST_LOG=iota_gas_station::access_controller=trace
 ```
+
+## Lock Acquisition Failed During Startup
+
+**Problem:**
+
+When starting the Gas Station, you encounter one of the following error messages:
+
+```log
+Another instance is already performing maintenance. Please wait for it to complete or use the --ignore-locks flag to force a full rescan.
+```
+
+or
+
+```log
+Another task is already initializing the pool. Please wait for it to complete or use the --ignore-locks flag to force a new initialization.
+```
+
+**Explanation:**
+
+The Gas Station uses distributed locks stored in Redis to prevent multiple instances from simultaneously performing critical operations:
+
+- **Maintenance lock:** Acquired during full rescan operations to prevent concurrent registry cleanup and gas coins objects alterations.
+- **Initialization lock:** Acquired during coin pool initialization to prevent multiple instances from splitting coins simultaneously.
+
+These locks have a maximum duration (12 hours by default) and are automatically released when the operation completes. However, if the Gas Station crashes or is forcefully terminated during one of these operations, the lock may remain in Redis until it expires naturally.
+
+**Solution:**
+
+If you are certain that no other Gas Station instance is currently performing the locked operation (e.g., after a crash or unexpected termination), you can bypass the lock check using the `--ignore-locks` flag:
+
+```bash
+./iota-gas-station --config-path config.yaml --ignore-locks
+```
+
+Or with Docker Compose, add the flag to the command:
+
+```yaml
+  iota-gas-station:
+  ...
+    command: ["--config-path", "/app/config.yaml", "--ignore-locks"]
+```
+
+> **Warning:** Only use `--ignore-locks` when you are confident that no other instance is actively performing the locked operation. Running concurrent initialization or maintenance operations can lead to data inconsistencies in the coin registry.
+
+## Configuration Changes Requiring Re-initialization
+
+**Problem:**
+
+When starting the Gas Station after modifying certain configuration parameters, you encounter the following error:
+
+```log
+Configuration changes requiring re-initialization detected: target_init_balance: Some(1000000000) -> Some(2000000000) but automatic reinitialization is not allowed. Please restart the gas station with the --allow-reinit flag to allow full rescan.
+```
+
+**Explanation:**
+
+Some configuration parameters are considered "cold params" — parameters that fundamentally affect how the coin pool is structured. When these parameters change, the existing coin registry becomes incompatible and requires a full re-initialization.
+
+Currently, the following parameters are cold params:
+
+- **`target_init_balance`** — The target balance for each gas coin in the pool. Changing this value requires re-splitting all coins to match the new target size.
+
+When a cold param change is detected, the Gas Station refuses to start automatically to prevent accidental data loss or extended downtime. This is a safety mechanism because:
+
+1. Full re-initialization deletes the existing coin registry and rescans all coins from the network
+2. The process can take significant time depending on the number of coins
+3. During re-initialization, the instance enters maintenance mode, which blocks all coin reservation requests on the current and all other running instances
+
+**Solution:**
+
+If you intentionally changed a cold param and understand the implications, restart the Gas Station with the `--allow-reinit` flag:
+
+```bash
+./iota-gas-station --config-path config.yaml --allow-reinit
+```
+
+Or with Docker Compose:
+
+```yaml
+  iota-gas-station:
+  ...
+    command: ["--config-path", "/app/config.yaml", "--allow-reinit"]
+```
+
+> **Warning:** During full re-initialization, the Gas Station acquires a maintenance lock. While this lock is held, all other Gas Station instances sharing the same Redis storage will enter maintenance mode and reject sponsorship requests. Plan configuration changes during low-traffic periods to minimize impact on users.

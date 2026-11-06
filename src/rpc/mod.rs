@@ -1,10 +1,13 @@
 // Copyright (c) Mysten Labs, Inc.
+// Modifications Copyright (c) 2026 IOTA Stiftung
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod client;
+pub(crate) mod effects;
 pub(crate) mod rpc_types;
 mod server;
 
+pub use effects::TransactionEffectsDto;
 pub use rpc_types::ExecuteTransactionRequestType;
 pub use server::GasStationServer;
 
@@ -12,11 +15,15 @@ pub use server::GasStationServer;
 mod tests {
     use std::time::Duration;
 
+    use iota_sdk_types::Transaction;
+
     use crate::access_controller::policy::AccessPolicy;
     use crate::access_controller::predicates::{ValueAggregate, ValueNumber};
     use crate::access_controller::rule::{predicate_names, AccessRuleBuilder};
     use crate::access_controller::AccessController;
-    use crate::config::GasStationConfig;
+    use crate::config::{Config, GasStationConfig, DEFAULT_MAX_GAS_BUDGET};
+    use crate::gas_station::gas_station_core::NANOS_PER_IOTA;
+    use crate::rpc::effects::ExecutionStatusDto;
     use crate::rpc::ExecuteTransactionRequestType;
     use crate::test_env::{
         create_test_transaction, fetch_redis_val, remove_redis_key, start_rpc_server_for_testing,
@@ -26,9 +33,6 @@ mod tests {
     use crate::tracker::stats_tracker_storage::redis::get_redis_aggr_key;
     use crate::tracker::stats_tracker_storage::AggregateType;
     use crate::AUTH_ENV_NAME;
-    use iota_config::Config;
-    use iota_json_rpc_types::IotaTransactionBlockEffectsAPI;
-    use iota_types::gas_coin::NANOS_PER_IOTA;
 
     #[tokio::test]
     async fn test_basic_rpc_flow() {
@@ -49,7 +53,7 @@ mod tests {
             .execute_tx(reservation_id, &tx_data, &user_sig, None, None)
             .await
             .unwrap();
-        assert!(effects.status().is_ok());
+        assert!(matches!(effects.status, ExecutionStatusDto::Success));
     }
 
     #[tokio::test]
@@ -233,7 +237,7 @@ mod tests {
             AggregateType::Sum,
             rule_meta.clone().into_iter().collect::<Vec<_>>().as_slice(),
         );
-        let redis_key = format!("{}:{}", signer_address, rule_key);
+        let redis_key = format!("{}:tracker:{}", signer_address, rule_key);
 
         // We want to make sure the redis key is not present
         remove_redis_key::<i64>(&redis_key);
@@ -250,6 +254,42 @@ mod tests {
 
         let value = fetch_redis_val::<i64>(&redis_key);
         assert_eq!(value, 0);
+    }
+
+    // `gas_payment.budget` is set by the client, so `execute_tx` checks it
+    // against `max-gas-budget`. A rejected request leaves the reservation
+    // usable.
+    #[tokio::test]
+    async fn test_execute_tx_rejects_gas_budget_above_max() {
+        let (test_cluster, _container, server) =
+            start_rpc_server_for_testing(vec![NANOS_PER_IOTA; 10], NANOS_PER_IOTA).await;
+        let client = server.get_local_client();
+
+        let (sponsor, reservation_id, gas_coins) =
+            client.reserve_gas(NANOS_PER_IOTA, 10).await.unwrap();
+        let (tx_data, user_sig) = create_test_transaction(&test_cluster, sponsor, gas_coins).await;
+
+        // Same transaction with a budget above the maximum. The signature no
+        // longer matches, but the request is rejected before it is checked.
+        let mut over_budget_tx = tx_data.clone();
+        let Transaction::V1(v1) = &mut over_budget_tx else {
+            unreachable!("create_test_transaction builds a V1 transaction")
+        };
+        v1.gas_payment.budget = DEFAULT_MAX_GAS_BUDGET + 1;
+        let err = client
+            .execute_tx(reservation_id, &over_budget_tx, &user_sig, None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Gas budget must be less than"),
+            "unexpected error: {err}"
+        );
+
+        let effects = client
+            .execute_tx(reservation_id, &tx_data, &user_sig, None, None)
+            .await
+            .unwrap();
+        assert!(matches!(effects.status, ExecutionStatusDto::Success));
     }
 
     #[tokio::test]
@@ -286,7 +326,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(effects.status().is_ok());
+        assert!(matches!(effects.status, ExecutionStatusDto::Success));
     }
 
     #[tokio::test]
@@ -314,6 +354,6 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(effects.status().is_ok());
+        assert!(matches!(effects.status, ExecutionStatusDto::Success));
     }
 }

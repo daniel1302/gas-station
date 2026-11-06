@@ -1,47 +1,18 @@
 // Copyright (c) Mysten Labs, Inc.
+// Modifications Copyright (c) 2026 IOTA Stiftung
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::base64::Base64;
+use crate::rpc::effects::{ObjectRefDto, TransactionEffectsDto};
 use crate::types::ReservationID;
-use fastcrypto::encoding::Base64;
-use iota_json_rpc_types::{IotaObjectRef, IotaTransactionBlockEffects};
-use iota_types::{
-    base_types::{IotaAddress, ObjectRef},
-    quorum_driver_types::ExecuteTransactionRequestType as IotaExecuteTransactionRequestType,
-};
+use iota_sdk_types::{Address, ObjectReference};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-
-// 2 IOTA.
-pub const MAX_BUDGET: u64 = 2_000_000_000;
-
-// 10 mins.
-pub const MAX_DURATION_S: u64 = 10 * 60;
 
 #[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
 pub struct ReserveGasRequest {
     pub gas_budget: u64,
     pub reserve_duration_secs: u64,
-}
-
-impl ReserveGasRequest {
-    pub fn check_validity(&self) -> anyhow::Result<()> {
-        if self.gas_budget == 0 {
-            anyhow::bail!("Gas budget must be positive");
-        }
-        if self.gas_budget > MAX_BUDGET {
-            anyhow::bail!("Gas budget must be less than {}", MAX_BUDGET);
-        }
-        if self.reserve_duration_secs == 0 {
-            anyhow::bail!("Reserve duration must be positive");
-        }
-        if self.reserve_duration_secs > MAX_DURATION_S {
-            anyhow::bail!(
-                "Reserve duration must be less than {} seconds",
-                MAX_DURATION_S
-            );
-        }
-        Ok(())
-    }
 }
 
 #[derive(Debug, JsonSchema, Serialize, Deserialize)]
@@ -52,16 +23,17 @@ pub struct ReserveGasResponse {
 
 #[derive(Debug, JsonSchema, Serialize, Deserialize)]
 pub struct ReserveGasResult {
-    pub sponsor_address: IotaAddress,
+    #[schemars(with = "String")]
+    pub sponsor_address: Address,
     pub reservation_id: ReservationID,
-    pub gas_coins: Vec<IotaObjectRef>,
+    pub gas_coins: Vec<ObjectRefDto>,
 }
 
 impl ReserveGasResponse {
     pub fn new_ok(
-        sponsor_address: IotaAddress,
+        sponsor_address: Address,
         reservation_id: ReservationID,
-        gas_coins: Vec<ObjectRef>,
+        gas_coins: Vec<ObjectReference>,
     ) -> Self {
         Self {
             result: Some(ReserveGasResult {
@@ -96,27 +68,14 @@ pub enum ExecuteTransactionRequestType {
     WaitForLocalExecution,
 }
 
-impl Into<Option<IotaExecuteTransactionRequestType>> for ExecuteTransactionRequestType {
-    fn into(self) -> Option<IotaExecuteTransactionRequestType> {
-        match self {
-            ExecuteTransactionRequestType::WaitForEffectsCert => {
-                Some(IotaExecuteTransactionRequestType::WaitForEffectsCert)
-            }
-            ExecuteTransactionRequestType::WaitForLocalExecution => {
-                Some(IotaExecuteTransactionRequestType::WaitForLocalExecution)
-            }
-        }
-    }
-}
-
 #[derive(Debug, JsonSchema, Serialize, Deserialize)]
 pub struct ExecuteTxResponse {
-    pub effects: Option<IotaTransactionBlockEffects>,
+    pub effects: Option<TransactionEffectsDto>,
     pub error: Option<String>,
 }
 
 impl ExecuteTxResponse {
-    pub fn new_ok(effects: IotaTransactionBlockEffects) -> Self {
+    pub fn new_ok(effects: TransactionEffectsDto) -> Self {
         Self {
             effects: Some(effects),
             error: None,
